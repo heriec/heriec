@@ -1,0 +1,114 @@
+name: Update profile badges
+
+on:
+  schedule:
+    # 08:17 Asia/Shanghai; GitHub may delay scheduled runs.
+    - cron: "17 0 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/UpdateStats.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-profile-output
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore output branch or initialize it
+        shell: bash
+        run: |
+          if git ls-remote --exit-code --heads origin output; then
+            git fetch origin output
+            git worktree add published FETCH_HEAD
+          else
+            git worktree add --detach published HEAD
+            git -C published checkout --orphan output
+            git -C published rm -rf .
+          fi
+      - name: Generate badges with last-valid-value fallback
+        shell: bash
+        run: |
+          set -euo pipefail
+          stats=published/github-stats.json
+          if [[ ! -f "$stats" ]]; then
+            printf '%s\n' '{"stars":125,"forks":56}' > "$stats"
+          fi
+          previous=$(jq -ce '
+            select((.stars | type == "number") and (.forks | type == "number"))
+            | select(.stars >= 0 and .forks >= 0)
+            | select(.stars == (.stars | floor) and .forks == (.forks | floor))
+            | {stars, forks}
+          ' "$stats")
+          current="$previous"
+          valid=false
+          for attempt in 1 2 3; do
+            if response=$(curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
+              'https://api.github-star-counter.workers.dev/user/heriec?source=profile') &&
+              candidate=$(jq -ce --argjson old "$previous" '
+                select((.stars | type == "number") and (.forks | type == "number"))
+                | select(.stars >= 0 and .forks >= 0)
+                | select(.stars == (.stars | floor) and .forks == (.forks | floor))
+                | select(($old.stars == 0 or (.stars > 0 and .stars >= $old.stars * 0.8))
+                     and ($old.forks == 0 or (.forks > 0 and .forks >= $old.forks * 0.8)))
+                | {stars, forks}
+              ' <<< "$response"); then
+              current="$candidate"
+              valid=true
+              break
+            fi
+            echo "Attempt $attempt failed fetching or validation."
+            if [[ "$attempt" -lt 3 ]]; then sleep 10; fi
+          done
+          if [[ "$valid" == false ]]; then
+            echo "::warning::Keeping last valid totals: $previous"
+          fi
+          jq . <<< "$current" > "$stats"
+
+          star_icon='<path d="m7 0 2.1 4.3 4.7.7-3.4 3.3.8 4.7L7 10.8 2.8 13l.8-4.7L.2 5l4.7-.7Z"/>'
+          fork_icon='<g fill="none" stroke="white" stroke-width="1.4"><circle cx="3" cy="2" r="1.5"/><circle cx="11" cy="2" r="1.5"/><circle cx="7" cy="12" r="1.5"/><path d="M3 3.5V5q0 2 4 2t4-2V3.5M7 7v3.5"/></g>'
+          for key in stars forks; do
+            value=$(jq -r --arg key "$key" '.[$key]' <<< "$current")
+            right=$(( ${#value} * 8 + 12 ))
+            if (( right < 25 )); then right=25; fi
+            width=$((65 + right))
+            center=$((65 + right / 2))
+            if [[ "$key" == stars ]]; then
+              label=Stars; icon="$star_icon"
+            else
+              label=Forks; icon="$fork_icon"
+            fi
+            cat > "published/$key.svg" <<EOF
+          <svg xmlns="http://www.w3.org/2000/svg" width="$width" height="20" viewBox="0 0 $width 20" role="img" aria-label="$label: $value">
+            <title>$label: $value</title>
+            <path fill="#181717" d="M0 0h${width}v20H0z"/>
+            <g transform="translate(6 3)" fill="white">$icon</g>
+            <g fill="white" font-family="Verdana,DejaVu Sans,sans-serif" font-size="11" text-anchor="middle">
+              <text x="42" y="14">$label</text>
+              <text x="$center" y="14">$value</text>
+            </g>
+          </svg>
+          EOF
+          done
+      - name: Publish only to output branch
+        shell: bash
+        run: |
+          cd published
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add github-stats.json stars.svg forks.svg
+          if git diff --cached --quiet; then
+            echo "Badges unchanged."
+            exit 0
+          fi
+          git commit -m "chore: update profile badges"
+          commit=$(git rev-parse HEAD)
+          git -C "${GITHUB_WORKSPACE}" push origin "${commit}:refs/heads/output"
